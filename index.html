@@ -718,6 +718,7 @@ async function pushToCloud() {
     }
   } catch (e) {
     console.error('Cloud-Sync Upload fehlgeschlagen:', e);
+    showToast(`Cloud-Push fehlgeschlagen: ${e.message}`);
   }
 }
 
@@ -733,6 +734,7 @@ async function pullFromCloud() {
     return true;
   } catch (e) {
     console.error('Cloud-Sync Download fehlgeschlagen:', e);
+    showToast(`Cloud-Pull fehlgeschlagen: ${e.message}`);
     return false;
   }
 }
