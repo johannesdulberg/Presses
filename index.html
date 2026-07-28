@@ -295,6 +295,18 @@
   }
   .settings-row label { color: var(--dim); flex: 1; }
   .settings-row input { width: 90px; background: var(--panel); border: 1px solid var(--line); color: var(--text); font-family: var(--mono); padding: 6px 8px; border-radius: 4px; }
+
+  .sync-block {
+    margin-top: 16px;
+    padding-top: 14px;
+    border-top: 1px dashed var(--line);
+  }
+  .sync-title { font-size: 12px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
+  .sync-hint { font-size: 11px; color: var(--dim); margin-bottom: 10px; line-height: 1.5; }
+  .sync-hint a { color: var(--accent); }
+  .sync-block .settings-row input[type=password],
+  .sync-block .settings-row input[type=text] { width: 160px; }
+  .sync-status { font-size: 11px; color: var(--dim); margin-top: 8px; min-height: 14px; }
 </style>
 </head>
 <body>
@@ -376,7 +388,30 @@
     <div class="settings-row">
       <button class="btn-ghost" id="saveSettings">Übernehmen</button>
       <button class="btn-ghost" id="exportBtn">Export JSON</button>
+      <button class="btn-ghost" id="importBtn">Import JSON</button>
+      <input type="file" id="importFile" accept="application/json" style="display:none;">
       <button class="btn-ghost" id="resetBtn">Profil löschen</button>
+    </div>
+
+    <div class="sync-block">
+      <div class="sync-title">☁️ Geräte-Sync (GitHub Gist)</div>
+      <div class="sync-hint">
+        Token nur mit Scope <strong>gist</strong> erstellen, sonst nichts:
+        <a href="https://github.com/settings/tokens/new?scopes=gist&description=Press%20Progression%20Sync" target="_blank" rel="noopener">github.com/settings/tokens/new</a>
+      </div>
+      <div class="settings-row">
+        <label for="ghTokenInput">GitHub Token</label>
+        <input type="password" id="ghTokenInput" placeholder="ghp_...">
+      </div>
+      <div class="settings-row">
+        <label for="ghGistIdInput">Gist ID</label>
+        <input type="text" id="ghGistIdInput" placeholder="leer = neu erstellen">
+      </div>
+      <div class="settings-row">
+        <button class="btn-ghost" id="connectGistBtn">Verbinden / Gist erstellen</button>
+        <button class="btn-ghost" id="syncNowBtn">Jetzt synchronisieren</button>
+      </div>
+      <div class="sync-status" id="syncStatus"></div>
     </div>
   </details>
 
@@ -500,6 +535,7 @@ function logSession(difficulty) {
   saveData(currentSlug, data);
   render();
   showToast(`Notiert: ${reps} Reps (${labelFor(difficulty)})${adjustMsg}`);
+  pushToGist(true);
 }
 
 function labelFor(difficulty) {
@@ -510,6 +546,7 @@ function deleteSession(index) {
   data.sessions.splice(index, 1);
   saveData(currentSlug, data);
   render();
+  pushToGist(true);
 }
 
 let resetConfirmPending = false;
@@ -547,6 +584,7 @@ function resetProfile() {
   saveProfiles(profiles);
   const deletedName = currentName;
   resetResetButtonUI();
+  pushToGist(true);
   goToGate();
   showToast(`Profil "${deletedName}" gelöscht`);
 }
@@ -563,6 +601,7 @@ function applySettings() {
   saveData(currentSlug, data);
   render();
   showToast('Wert übernommen');
+  pushToGist(true);
 }
 
 function exportJSON() {
@@ -573,6 +612,189 @@ function exportJSON() {
   a.download = `press-progression-${currentSlug}-${todayStr()}.json`;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+function importJSON(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    let parsed;
+    try {
+      parsed = JSON.parse(reader.result);
+    } catch (e) {
+      showToast('Datei ist kein gültiges JSON');
+      return;
+    }
+    // minimal shape check
+    if (typeof parsed.value !== 'number' || !Array.isArray(parsed.sessions) || !parsed.settings) {
+      showToast('Datei hat nicht das erwartete Format');
+      return;
+    }
+    const importedFrom = parsed.name || 'unbekannt';
+
+    data = {
+      settings: parsed.settings,
+      value: parsed.value,
+      hardStreak: parsed.hardStreak || 0,
+      easyStreak: parsed.easyStreak || 0,
+      sessions: parsed.sessions
+    };
+    saveData(currentSlug, data);
+    render();
+    showToast(`Import abgeschlossen (Quelle: ${importedFrom}) — Profil "${currentName}" überschrieben`);
+    pushToGist(true);
+  };
+  reader.readAsText(file);
+}
+
+/* ---------- Cloud Sync (GitHub Gist) ----------
+   Uses a GitHub Gist as a free JSON store so multiple devices can share one
+   set of profiles. The whole profiles registry + every profile's data is
+   bundled into one file inside the gist. "Last write wins" — no merge logic,
+   so near-simultaneous edits on two devices can clobber each other. Fine for
+   low-stakes personal use; not fine for anything you'd be upset to lose.
+
+   Security note: the GitHub token lives in localStorage in plaintext and is
+   sent from the browser on every sync call — visible to anyone with access
+   to this browser profile or its devtools network tab. That's why the setup
+   link only requests the "gist" scope: worst case if it leaks, someone can
+   read/write your gists, not your repos or account.
+*/
+const GIST_CONFIG_KEY = 'pressProgressionGistConfig_v1';
+const GIST_FILENAME = 'press-progression-sync.json';
+
+function getGistConfig() {
+  try { return JSON.parse(localStorage.getItem(GIST_CONFIG_KEY)) || {}; }
+  catch (e) { return {}; }
+}
+function saveGistConfig(cfg) {
+  localStorage.setItem(GIST_CONFIG_KEY, JSON.stringify(cfg));
+}
+
+function setSyncStatus(msg) {
+  const el = document.getElementById('syncStatus');
+  if (el) el.textContent = msg;
+}
+
+function buildSyncPayload() {
+  const profiles = loadProfiles();
+  const allData = {};
+  Object.keys(profiles).forEach(slug => {
+    const d = loadData(slug);
+    if (d) allData[slug] = d;
+  });
+  return { profiles, data: allData, syncedAt: new Date().toISOString() };
+}
+
+function applySyncPayload(payload) {
+  if (!payload || !payload.data || !payload.profiles) return;
+  const localProfiles = loadProfiles();
+  Object.assign(localProfiles, payload.profiles); // remote wins on name conflicts
+  saveProfiles(localProfiles);
+  Object.keys(payload.data).forEach(slug => {
+    saveData(slug, payload.data[slug]);
+  });
+}
+
+async function ghGistRequest(method, cfg, body) {
+  const url = cfg.gistId
+    ? `https://api.github.com/gists/${cfg.gistId}`
+    : `https://api.github.com/gists`;
+  const res = await fetch(url, {
+    method,
+    headers: {
+      'Authorization': `token ${cfg.token}`,
+      'Accept': 'application/vnd.github+json',
+      'Content-Type': 'application/json'
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => '');
+    throw new Error(`GitHub API ${res.status}: ${errBody.slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+async function pushToGist(silent) {
+  const cfg = getGistConfig();
+  if (!cfg.token || !cfg.gistId) return; // not configured, silently skip
+  try {
+    if (!silent) setSyncStatus('Synchronisiere…');
+    const payload = buildSyncPayload();
+    await ghGistRequest('PATCH', cfg, {
+      files: { [GIST_FILENAME]: { content: JSON.stringify(payload, null, 2) } }
+    });
+    if (!silent) setSyncStatus(`Hochgeladen · ${new Date().toLocaleTimeString('de-DE')}`);
+  } catch (e) {
+    console.error(e);
+    setSyncStatus('Upload fehlgeschlagen — Token/Gist ID prüfen');
+  }
+}
+
+async function pullFromGist(silent) {
+  const cfg = getGistConfig();
+  if (!cfg.token || !cfg.gistId) return false;
+  try {
+    if (!silent) setSyncStatus('Lade…');
+    const gist = await ghGistRequest('GET', cfg);
+    const file = gist.files && gist.files[GIST_FILENAME];
+    if (!file || !file.content) { setSyncStatus('Gist enthält noch keine Daten'); return false; }
+    const payload = JSON.parse(file.content);
+    applySyncPayload(payload);
+    if (!silent) setSyncStatus(`Geladen · ${new Date().toLocaleTimeString('de-DE')}`);
+    return true;
+  } catch (e) {
+    console.error(e);
+    setSyncStatus('Download fehlgeschlagen — Token/Gist ID prüfen');
+    return false;
+  }
+}
+
+async function connectOrCreateGist() {
+  const token = document.getElementById('ghTokenInput').value.trim();
+  let gistId = document.getElementById('ghGistIdInput').value.trim();
+
+  if (!token) { showToast('Bitte Token eingeben'); return; }
+
+  const cfg = { token, gistId };
+  saveGistConfig(cfg);
+
+  if (gistId) {
+    // connect to existing gist, pull immediately
+    setSyncStatus('Verbinde…');
+    const ok = await pullFromGist(true);
+    setSyncStatus(ok ? 'Verbunden, Daten geladen' : 'Verbunden, aber Laden fehlgeschlagen');
+    if (ok) render();
+    return;
+  }
+
+  // no gist id yet — create one seeded with current local state
+  try {
+    setSyncStatus('Erstelle Gist…');
+    const payload = buildSyncPayload();
+    const created = await ghGistRequest('POST', cfg, {
+      description: 'Press Progression sync data',
+      public: false,
+      files: { [GIST_FILENAME]: { content: JSON.stringify(payload, null, 2) } }
+    });
+    cfg.gistId = created.id;
+    saveGistConfig(cfg);
+    document.getElementById('ghGistIdInput').value = created.id;
+    setSyncStatus(`Gist erstellt: ${created.id} — auf dem anderen Gerät diese ID eintragen`);
+  } catch (e) {
+    console.error(e);
+    setSyncStatus('Gist-Erstellung fehlgeschlagen — Token prüfen (Scope: gist)');
+  }
+}
+
+async function manualSync() {
+  const cfg = getGistConfig();
+  if (!cfg.token || !cfg.gistId) { showToast('Erst verbinden'); return; }
+  await pullFromGist(true);
+  await pushToGist(true);
+  data = loadData(currentSlug); // reflect any remote changes for current profile
+  render();
+  setSyncStatus(`Synchronisiert · ${new Date().toLocaleTimeString('de-DE')}`);
 }
 
 /* ---------- Chart ----------
@@ -752,6 +974,10 @@ function render() {
     `Profil: ${currentName} · ${data.sessions.length} Sessions gesamt`;
 
   document.getElementById('manualTargetInput').value = Math.round(data.value * 100) / 100;
+
+  const gistCfg = getGistConfig();
+  document.getElementById('ghTokenInput').value = gistCfg.token || '';
+  document.getElementById('ghGistIdInput').value = gistCfg.gistId || '';
 }
 
 /* ---------- Gate / profile switching ---------- */
@@ -812,6 +1038,19 @@ function enterApp(name) {
   document.getElementById('gate').style.display = 'none';
   document.getElementById('app').style.display = 'block';
   render();
+
+  // Open instantly with local cache; if cloud sync is configured, pull in
+  // the background and re-render once it lands rather than blocking on it.
+  const cfg = getGistConfig();
+  if (cfg.token && cfg.gistId) {
+    pullFromGist(true).then(ok => {
+      if (ok && currentSlug === slug) {
+        data = loadData(slug);
+        render();
+        showToast('Cloud-Sync: aktueller Stand geladen');
+      }
+    });
+  }
 }
 
 /* ---------- Events ---------- */
@@ -832,7 +1071,17 @@ document.getElementById('logHard').addEventListener('click', () => logSession('h
 document.getElementById('switchUserBtn').addEventListener('click', goToGate);
 document.getElementById('saveSettings').addEventListener('click', applySettings);
 document.getElementById('exportBtn').addEventListener('click', exportJSON);
+document.getElementById('importBtn').addEventListener('click', () => {
+  document.getElementById('importFile').click();
+});
+document.getElementById('importFile').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (file) importJSON(file);
+  e.target.value = ''; // allow re-selecting the same file later
+});
 document.getElementById('resetBtn').addEventListener('click', handleResetClick);
+document.getElementById('connectGistBtn').addEventListener('click', connectOrCreateGist);
+document.getElementById('syncNowBtn').addEventListener('click', manualSync);
 
 /* ---------- Init ---------- */
 goToGate();
