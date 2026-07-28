@@ -616,65 +616,65 @@ function importJSON(file) {
 }
 
 /* ---------- Cloud Sync (automatic, single shared JSON) ----------
-   No settings UI, no per-user tokens. Credentials are baked into this file
+   No settings UI, no per-user keys. Credentials are baked into this file
    once, by whoever deploys it — after that it's invisible: every load pulls
    the latest shared state, every change pushes it back. All profiles live in
-   ONE gist file together (see buildSyncPayload), so anyone using this exact
+   ONE bin together (see buildSyncPayload), so anyone using this exact
    deployed page shares the same cloud storage automatically.
 
-   SECURITY TRADE-OFF, worth understanding before relying on this: baking the
-   token into the file means it sits in plain text in the public page source
-   — anyone who finds the URL can view it via "view source", not just people
-   you shared the link with. The token is scoped to "gist" only, so the
-   worst case is someone reading/editing/deleting your gists — not your repos
-   or account. If that's not an acceptable risk for you, this pattern isn't
-   the right one; a per-user token entered locally (not committed to the
-   repo) would be safer at the cost of the manual setup step this avoids.
+   Backend: jsonbin.io, not a GitHub Gist. GitHub auto-revokes any GitHub PAT
+   it detects in a public repo (confirmed the hard way) — that's a hard rule
+   for GitHub's own token format specifically, not a generic policy, so it
+   doesn't apply to a jsonbin.io key. That removes the self-destruct problem,
+   but NOT the underlying exposure: this key still sits in plain text in the
+   public page source, same as before. Worst case here is someone reading or
+   overwriting this one bin's contents — not account-wide access like a
+   broader-scoped credential might allow.
 
    SETUP (do this once):
-   1. Set GIST_TOKEN below to a Personal Access Token with ONLY the "gist"
-      scope (github.com/settings/tokens/new?scopes=gist).
-   2. Leave GIST_ID empty and deploy. On first load in any browser, this
-      script creates a new gist automatically and logs its ID to the
+   1. Create a free account at jsonbin.io, grab the Master Key from the API
+      Keys page, and set JSONBIN_KEY below to it.
+   2. Leave JSONBIN_BIN_ID empty and deploy. On first load in any browser,
+      this script creates a new bin automatically and logs its ID to the
       console (and shows it in a toast).
-   3. Copy that ID into GIST_ID below and redeploy, so every device/browser
-      — including ones with no local cache yet — knows where to look.
-      Until you do this, each *fresh* browser without a cached ID would
-      otherwise create its own separate gist instead of joining yours.
+   3. Copy that ID into JSONBIN_BIN_ID below and redeploy, so every
+      device/browser — including ones with no local cache yet — knows where
+      to look. Until you do this, each *fresh* browser without a cached ID
+      would otherwise create its own separate bin instead of joining yours.
 */
-const GIST_TOKEN = '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';
-const GIST_ID = 'b517d1d92d96ea9b72dd922dfa3d3ab4';
-const GIST_FILENAME = 'press-progression-sync.json';
-const RUNTIME_GIST_ID_KEY = 'pressProgressionRuntimeGistId_v1';
+const JSONBIN_KEY = '$2a$10$W8CMcVUepKHSGHevHRzyCuHMjG.nZF5WaIubj.A7cF/88bYcV9muC';
+const JSONBIN_BIN_ID = ''; // fill in after step 2 above
+const RUNTIME_BIN_ID_KEY = 'pressProgressionRuntimeBinId_v1';
 
 function syncEnabled() {
-  return !!GIST_TOKEN && GIST_TOKEN.indexOf('PASTE_') !== 0;
+  return !!JSONBIN_KEY && JSONBIN_KEY.indexOf('PASTE_') !== 0;
 }
 
-// Fallback for the gap between "gist auto-created" and "GIST_ID constant
-// updated + redeployed" — lets the device that created it keep working
-// immediately without waiting for a redeploy.
-function getActiveGistId() {
-  return GIST_ID || localStorage.getItem(RUNTIME_GIST_ID_KEY) || '';
+// Fallback for the gap between "bin auto-created" and "JSONBIN_BIN_ID
+// constant updated + redeployed" — lets the device that created it keep
+// working immediately without waiting for a redeploy.
+function getActiveBinId() {
+  return JSONBIN_BIN_ID || localStorage.getItem(RUNTIME_BIN_ID_KEY) || '';
 }
-function setRuntimeGistId(id) {
-  localStorage.setItem(RUNTIME_GIST_ID_KEY, id);
+function setRuntimeBinId(id) {
+  localStorage.setItem(RUNTIME_BIN_ID_KEY, id);
 }
 
-async function ghGistRequest(method, gistId, body) {
-  const url = gistId ? `https://api.github.com/gists/${gistId}` : `https://api.github.com/gists`;
+async function jsonbinRequest(method, binId, body) {
+  const url = binId ? `https://api.jsonbin.io/v3/b/${binId}` : `https://api.jsonbin.io/v3/b`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-Master-Key': JSONBIN_KEY
+  };
+  if (method === 'GET') headers['X-Bin-Meta'] = 'false'; // return raw content, no wrapper
   const res = await fetch(url, {
     method,
-    headers: {
-      'Authorization': `token ${GIST_TOKEN}`,
-      'Accept': 'application/vnd.github+json',
-      'Content-Type': 'application/json'
-    },
+    headers,
     body: body ? JSON.stringify(body) : undefined
   });
   if (!res.ok) {
     const errBody = await res.text().catch(() => '');
-    throw new Error(`GitHub API ${res.status}: ${errBody.slice(0, 200)}`);
+    throw new Error(`jsonbin API ${res.status}: ${errBody.slice(0, 200)}`);
   }
   return res.json();
 }
@@ -700,21 +700,16 @@ function applySyncPayload(payload) {
 async function pushToCloud() {
   if (!syncEnabled()) return;
   try {
-    const gistId = getActiveGistId();
+    const binId = getActiveBinId();
     const payload = buildSyncPayload();
-    if (!gistId) {
-      const created = await ghGistRequest('POST', null, {
-        description: 'Press Progression sync data',
-        public: false,
-        files: { [GIST_FILENAME]: { content: JSON.stringify(payload, null, 2) } }
-      });
-      setRuntimeGistId(created.id);
-      console.log(`Neuer Gist erstellt: ${created.id} — GIST_ID im Code darauf setzen und redeployen.`);
+    if (!binId) {
+      const created = await jsonbinRequest('POST', null, payload);
+      const newId = created.metadata.id;
+      setRuntimeBinId(newId);
+      console.log(`Neue Bin erstellt: ${newId} — JSONBIN_BIN_ID im Code darauf setzen und redeployen.`);
       showToast(`Cloud-Speicher eingerichtet (ID im Log/Konsole)`);
     } else {
-      await ghGistRequest('PATCH', gistId, {
-        files: { [GIST_FILENAME]: { content: JSON.stringify(payload, null, 2) } }
-      });
+      await jsonbinRequest('PUT', binId, payload);
     }
   } catch (e) {
     console.error('Cloud-Sync Upload fehlgeschlagen:', e);
@@ -724,13 +719,11 @@ async function pushToCloud() {
 
 async function pullFromCloud() {
   if (!syncEnabled()) return false;
-  const gistId = getActiveGistId();
-  if (!gistId) return false;
+  const binId = getActiveBinId();
+  if (!binId) return false;
   try {
-    const gist = await ghGistRequest('GET', gistId);
-    const file = gist.files && gist.files[GIST_FILENAME];
-    if (!file || !file.content) return false;
-    applySyncPayload(JSON.parse(file.content));
+    const payload = await jsonbinRequest('GET', binId);
+    applySyncPayload(payload);
     return true;
   } catch (e) {
     console.error('Cloud-Sync Download fehlgeschlagen:', e);
@@ -1024,3 +1017,4 @@ document.getElementById('resetBtn').addEventListener('click', handleResetClick);
 </script>
 </body>
 </html>
+
