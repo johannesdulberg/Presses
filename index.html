@@ -296,17 +296,7 @@
   .settings-row label { color: var(--dim); flex: 1; }
   .settings-row input { width: 90px; background: var(--panel); border: 1px solid var(--line); color: var(--text); font-family: var(--mono); padding: 6px 8px; border-radius: 4px; }
 
-  .sync-block {
-    margin-top: 16px;
-    padding-top: 14px;
-    border-top: 1px dashed var(--line);
-  }
-  .sync-title { font-size: 12px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
-  .sync-hint { font-size: 11px; color: var(--dim); margin-bottom: 10px; line-height: 1.5; }
-  .sync-hint a { color: var(--accent); }
-  .sync-block .settings-row input[type=password],
-  .sync-block .settings-row input[type=text] { width: 160px; }
-  .sync-status { font-size: 11px; color: var(--dim); margin-top: 8px; min-height: 14px; }
+
 </style>
 </head>
 <body>
@@ -391,27 +381,6 @@
       <button class="btn-ghost" id="importBtn">Import JSON</button>
       <input type="file" id="importFile" accept="application/json" style="display:none;">
       <button class="btn-ghost" id="resetBtn">Profil löschen</button>
-    </div>
-
-    <div class="sync-block">
-      <div class="sync-title">☁️ Geräte-Sync (GitHub Gist)</div>
-      <div class="sync-hint">
-        Token nur mit Scope <strong>gist</strong> erstellen, sonst nichts:
-        <a href="https://github.com/settings/tokens/new?scopes=gist&description=Press%20Progression%20Sync" target="_blank" rel="noopener">github.com/settings/tokens/new</a>
-      </div>
-      <div class="settings-row">
-        <label for="ghTokenInput">GitHub Token</label>
-        <input type="password" id="ghTokenInput" placeholder="ghp_...">
-      </div>
-      <div class="settings-row">
-        <label for="ghGistIdInput">Gist ID</label>
-        <input type="text" id="ghGistIdInput" placeholder="leer = neu erstellen">
-      </div>
-      <div class="settings-row">
-        <button class="btn-ghost" id="connectGistBtn">Verbinden / Gist erstellen</button>
-        <button class="btn-ghost" id="syncNowBtn">Jetzt synchronisieren</button>
-      </div>
-      <div class="sync-status" id="syncStatus"></div>
     </div>
   </details>
 
@@ -535,7 +504,7 @@ function logSession(difficulty) {
   saveData(currentSlug, data);
   render();
   showToast(`Notiert: ${reps} Reps (${labelFor(difficulty)})${adjustMsg}`);
-  pushToGist(true);
+  pushToCloud();
 }
 
 function labelFor(difficulty) {
@@ -546,7 +515,7 @@ function deleteSession(index) {
   data.sessions.splice(index, 1);
   saveData(currentSlug, data);
   render();
-  pushToGist(true);
+  pushToCloud();
 }
 
 let resetConfirmPending = false;
@@ -584,7 +553,7 @@ function resetProfile() {
   saveProfiles(profiles);
   const deletedName = currentName;
   resetResetButtonUI();
-  pushToGist(true);
+  pushToCloud();
   goToGate();
   showToast(`Profil "${deletedName}" gelöscht`);
 }
@@ -601,7 +570,7 @@ function applySettings() {
   saveData(currentSlug, data);
   render();
   showToast('Wert übernommen');
-  pushToGist(true);
+  pushToCloud();
 }
 
 function exportJSON() {
@@ -641,38 +610,73 @@ function importJSON(file) {
     saveData(currentSlug, data);
     render();
     showToast(`Import abgeschlossen (Quelle: ${importedFrom}) — Profil "${currentName}" überschrieben`);
-    pushToGist(true);
+    pushToCloud();
   };
   reader.readAsText(file);
 }
 
-/* ---------- Cloud Sync (GitHub Gist) ----------
-   Uses a GitHub Gist as a free JSON store so multiple devices can share one
-   set of profiles. The whole profiles registry + every profile's data is
-   bundled into one file inside the gist. "Last write wins" — no merge logic,
-   so near-simultaneous edits on two devices can clobber each other. Fine for
-   low-stakes personal use; not fine for anything you'd be upset to lose.
+/* ---------- Cloud Sync (automatic, single shared JSON) ----------
+   No settings UI, no per-user tokens. Credentials are baked into this file
+   once, by whoever deploys it — after that it's invisible: every load pulls
+   the latest shared state, every change pushes it back. All profiles live in
+   ONE gist file together (see buildSyncPayload), so anyone using this exact
+   deployed page shares the same cloud storage automatically.
 
-   Security note: the GitHub token lives in localStorage in plaintext and is
-   sent from the browser on every sync call — visible to anyone with access
-   to this browser profile or its devtools network tab. That's why the setup
-   link only requests the "gist" scope: worst case if it leaks, someone can
-   read/write your gists, not your repos or account.
+   SECURITY TRADE-OFF, worth understanding before relying on this: baking the
+   token into the file means it sits in plain text in the public page source
+   — anyone who finds the URL can view it via "view source", not just people
+   you shared the link with. The token is scoped to "gist" only, so the
+   worst case is someone reading/editing/deleting your gists — not your repos
+   or account. If that's not an acceptable risk for you, this pattern isn't
+   the right one; a per-user token entered locally (not committed to the
+   repo) would be safer at the cost of the manual setup step this avoids.
+
+   SETUP (do this once):
+   1. Set GIST_TOKEN below to a Personal Access Token with ONLY the "gist"
+      scope (github.com/settings/tokens/new?scopes=gist).
+   2. Leave GIST_ID empty and deploy. On first load in any browser, this
+      script creates a new gist automatically and logs its ID to the
+      console (and shows it in a toast).
+   3. Copy that ID into GIST_ID below and redeploy, so every device/browser
+      — including ones with no local cache yet — knows where to look.
+      Until you do this, each *fresh* browser without a cached ID would
+      otherwise create its own separate gist instead of joining yours.
 */
-const GIST_CONFIG_KEY = 'pressProgressionGistConfig_v1';
+const GIST_TOKEN = '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';
+const GIST_ID = 'b517d1d92d96ea9b72dd922dfa3d3ab4';
 const GIST_FILENAME = 'press-progression-sync.json';
+const RUNTIME_GIST_ID_KEY = 'pressProgressionRuntimeGistId_v1';
 
-function getGistConfig() {
-  try { return JSON.parse(localStorage.getItem(GIST_CONFIG_KEY)) || {}; }
-  catch (e) { return {}; }
-}
-function saveGistConfig(cfg) {
-  localStorage.setItem(GIST_CONFIG_KEY, JSON.stringify(cfg));
+function syncEnabled() {
+  return !!GIST_TOKEN && GIST_TOKEN.indexOf('PASTE_') !== 0;
 }
 
-function setSyncStatus(msg) {
-  const el = document.getElementById('syncStatus');
-  if (el) el.textContent = msg;
+// Fallback for the gap between "gist auto-created" and "GIST_ID constant
+// updated + redeployed" — lets the device that created it keep working
+// immediately without waiting for a redeploy.
+function getActiveGistId() {
+  return GIST_ID || localStorage.getItem(RUNTIME_GIST_ID_KEY) || '';
+}
+function setRuntimeGistId(id) {
+  localStorage.setItem(RUNTIME_GIST_ID_KEY, id);
+}
+
+async function ghGistRequest(method, gistId, body) {
+  const url = gistId ? `https://api.github.com/gists/${gistId}` : `https://api.github.com/gists`;
+  const res = await fetch(url, {
+    method,
+    headers: {
+      'Authorization': `token ${GIST_TOKEN}`,
+      'Accept': 'application/vnd.github+json',
+      'Content-Type': 'application/json'
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => '');
+    throw new Error(`GitHub API ${res.status}: ${errBody.slice(0, 200)}`);
+  }
+  return res.json();
 }
 
 function buildSyncPayload() {
@@ -690,111 +694,47 @@ function applySyncPayload(payload) {
   const localProfiles = loadProfiles();
   Object.assign(localProfiles, payload.profiles); // remote wins on name conflicts
   saveProfiles(localProfiles);
-  Object.keys(payload.data).forEach(slug => {
-    saveData(slug, payload.data[slug]);
-  });
+  Object.keys(payload.data).forEach(slug => saveData(slug, payload.data[slug]));
 }
 
-async function ghGistRequest(method, cfg, body) {
-  const url = cfg.gistId
-    ? `https://api.github.com/gists/${cfg.gistId}`
-    : `https://api.github.com/gists`;
-  const res = await fetch(url, {
-    method,
-    headers: {
-      'Authorization': `token ${cfg.token}`,
-      'Accept': 'application/vnd.github+json',
-      'Content-Type': 'application/json'
-    },
-    body: body ? JSON.stringify(body) : undefined
-  });
-  if (!res.ok) {
-    const errBody = await res.text().catch(() => '');
-    throw new Error(`GitHub API ${res.status}: ${errBody.slice(0, 200)}`);
-  }
-  return res.json();
-}
-
-async function pushToGist(silent) {
-  const cfg = getGistConfig();
-  if (!cfg.token || !cfg.gistId) return; // not configured, silently skip
+async function pushToCloud() {
+  if (!syncEnabled()) return;
   try {
-    if (!silent) setSyncStatus('Synchronisiere…');
+    const gistId = getActiveGistId();
     const payload = buildSyncPayload();
-    await ghGistRequest('PATCH', cfg, {
-      files: { [GIST_FILENAME]: { content: JSON.stringify(payload, null, 2) } }
-    });
-    if (!silent) setSyncStatus(`Hochgeladen · ${new Date().toLocaleTimeString('de-DE')}`);
+    if (!gistId) {
+      const created = await ghGistRequest('POST', null, {
+        description: 'Press Progression sync data',
+        public: false,
+        files: { [GIST_FILENAME]: { content: JSON.stringify(payload, null, 2) } }
+      });
+      setRuntimeGistId(created.id);
+      console.log(`Neuer Gist erstellt: ${created.id} — GIST_ID im Code darauf setzen und redeployen.`);
+      showToast(`Cloud-Speicher eingerichtet (ID im Log/Konsole)`);
+    } else {
+      await ghGistRequest('PATCH', gistId, {
+        files: { [GIST_FILENAME]: { content: JSON.stringify(payload, null, 2) } }
+      });
+    }
   } catch (e) {
-    console.error(e);
-    setSyncStatus('Upload fehlgeschlagen — Token/Gist ID prüfen');
+    console.error('Cloud-Sync Upload fehlgeschlagen:', e);
   }
 }
 
-async function pullFromGist(silent) {
-  const cfg = getGistConfig();
-  if (!cfg.token || !cfg.gistId) return false;
+async function pullFromCloud() {
+  if (!syncEnabled()) return false;
+  const gistId = getActiveGistId();
+  if (!gistId) return false;
   try {
-    if (!silent) setSyncStatus('Lade…');
-    const gist = await ghGistRequest('GET', cfg);
+    const gist = await ghGistRequest('GET', gistId);
     const file = gist.files && gist.files[GIST_FILENAME];
-    if (!file || !file.content) { setSyncStatus('Gist enthält noch keine Daten'); return false; }
-    const payload = JSON.parse(file.content);
-    applySyncPayload(payload);
-    if (!silent) setSyncStatus(`Geladen · ${new Date().toLocaleTimeString('de-DE')}`);
+    if (!file || !file.content) return false;
+    applySyncPayload(JSON.parse(file.content));
     return true;
   } catch (e) {
-    console.error(e);
-    setSyncStatus('Download fehlgeschlagen — Token/Gist ID prüfen');
+    console.error('Cloud-Sync Download fehlgeschlagen:', e);
     return false;
   }
-}
-
-async function connectOrCreateGist() {
-  const token = document.getElementById('ghTokenInput').value.trim();
-  let gistId = document.getElementById('ghGistIdInput').value.trim();
-
-  if (!token) { showToast('Bitte Token eingeben'); return; }
-
-  const cfg = { token, gistId };
-  saveGistConfig(cfg);
-
-  if (gistId) {
-    // connect to existing gist, pull immediately
-    setSyncStatus('Verbinde…');
-    const ok = await pullFromGist(true);
-    setSyncStatus(ok ? 'Verbunden, Daten geladen' : 'Verbunden, aber Laden fehlgeschlagen');
-    if (ok) render();
-    return;
-  }
-
-  // no gist id yet — create one seeded with current local state
-  try {
-    setSyncStatus('Erstelle Gist…');
-    const payload = buildSyncPayload();
-    const created = await ghGistRequest('POST', cfg, {
-      description: 'Press Progression sync data',
-      public: false,
-      files: { [GIST_FILENAME]: { content: JSON.stringify(payload, null, 2) } }
-    });
-    cfg.gistId = created.id;
-    saveGistConfig(cfg);
-    document.getElementById('ghGistIdInput').value = created.id;
-    setSyncStatus(`Gist erstellt: ${created.id} — auf dem anderen Gerät diese ID eintragen`);
-  } catch (e) {
-    console.error(e);
-    setSyncStatus('Gist-Erstellung fehlgeschlagen — Token prüfen (Scope: gist)');
-  }
-}
-
-async function manualSync() {
-  const cfg = getGistConfig();
-  if (!cfg.token || !cfg.gistId) { showToast('Erst verbinden'); return; }
-  await pullFromGist(true);
-  await pushToGist(true);
-  data = loadData(currentSlug); // reflect any remote changes for current profile
-  render();
-  setSyncStatus(`Synchronisiert · ${new Date().toLocaleTimeString('de-DE')}`);
 }
 
 /* ---------- Chart ----------
@@ -974,10 +914,6 @@ function render() {
     `Profil: ${currentName} · ${data.sessions.length} Sessions gesamt`;
 
   document.getElementById('manualTargetInput').value = Math.round(data.value * 100) / 100;
-
-  const gistCfg = getGistConfig();
-  document.getElementById('ghTokenInput').value = gistCfg.token || '';
-  document.getElementById('ghGistIdInput').value = gistCfg.gistId || '';
 }
 
 /* ---------- Gate / profile switching ---------- */
@@ -1024,6 +960,7 @@ function enterApp(name) {
     const profiles = loadProfiles();
     profiles[slug] = name;
     saveProfiles(profiles);
+    pushToCloud(); // make the new profile visible to other devices right away
   } else {
     const profiles = loadProfiles();
     profiles[slug] = name; // keep display name in sync
@@ -1039,18 +976,14 @@ function enterApp(name) {
   document.getElementById('app').style.display = 'block';
   render();
 
-  // Open instantly with local cache; if cloud sync is configured, pull in
-  // the background and re-render once it lands rather than blocking on it.
-  const cfg = getGistConfig();
-  if (cfg.token && cfg.gistId) {
-    pullFromGist(true).then(ok => {
-      if (ok && currentSlug === slug) {
-        data = loadData(slug);
-        render();
-        showToast('Cloud-Sync: aktueller Stand geladen');
-      }
-    });
-  }
+  // Show local cache instantly, then quietly check the cloud for anything
+  // newer (e.g. logged from another device) and re-render if it landed.
+  pullFromCloud().then(ok => {
+    if (ok && currentSlug === slug) {
+      data = loadData(slug);
+      render();
+    }
+  });
 }
 
 /* ---------- Events ---------- */
@@ -1080,11 +1013,12 @@ document.getElementById('importFile').addEventListener('change', (e) => {
   e.target.value = ''; // allow re-selecting the same file later
 });
 document.getElementById('resetBtn').addEventListener('click', handleResetClick);
-document.getElementById('connectGistBtn').addEventListener('click', connectOrCreateGist);
-document.getElementById('syncNowBtn').addEventListener('click', manualSync);
 
 /* ---------- Init ---------- */
-goToGate();
+(async () => {
+  await pullFromCloud();
+  goToGate();
+})();
 </script>
 </body>
 </html>
